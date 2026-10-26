@@ -194,31 +194,38 @@ fn sha256_file(path: &Path) -> Result<String> {
 }
 
 fn verified_cache_path(root: &Path, artifact: &Artifact<'_>) -> Result<Option<PathBuf>> {
-    let path = root.join(if cfg!(windows) { "biber.exe" } else { "biber" });
-    let marker = root.join("biber.sha256");
-    let saved = match fs::read_to_string(marker) {
-        Ok(saved) => saved,
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let Some((archive_hash, executable_hash)) = saved.trim().split_once(' ') else {
-        return Ok(None);
-    };
-    if archive_hash != artifact.archive_sha256 || executable_hash.len() != 64 {
-        return Ok(None);
-    }
-    match sha256_file(&path) {
-        Ok(hash) if hash == executable_hash => Ok(Some(path)),
-        Ok(_) => Ok(None),
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            Ok(None)
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("biber-") || !name.ends_with(".sha256") {
+            continue;
         }
-        Err(error) => Err(error),
+        let saved = fs::read_to_string(entry.path())?;
+        let Some((archive_hash, executable_hash)) = saved.trim().split_once(' ') else {
+            continue;
+        };
+        if archive_hash != artifact.archive_sha256 || executable_hash.len() != 64 {
+            continue;
+        }
+        let executable_name = name.trim_end_matches(".sha256");
+        let path = root.join(executable_name);
+        match sha256_file(&path) {
+            Ok(hash) if hash == executable_hash => return Ok(Some(path)),
+            Ok(_) => {}
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound) => {}
+            Err(error) => return Err(error),
+        }
     }
+    Ok(None)
 }
 
 fn extract_executable(
@@ -275,23 +282,12 @@ fn resolve_with_backend<B: GetUrlBackend>(
     }
 
     fs::create_dir_all(root)?;
-    let mut archive = tempfile::NamedTempFile::new_in(root)?;
-    let response = backend
-        .get_url(artifact.url)
-        .with_context(|| format!("could not download Biber {}", artifact.version))?;
-    let bytes = std::io::copy(
-        &mut response.take(MAX_ARCHIVE_BYTES + 1),
-        archive.as_file_mut(),
-    )?;
-    if bytes > MAX_ARCHIVE_BYTES {
-        bail!("Biber archive exceeds the maximum allowed size");
-    }
-    archive.flush()?;
-    if sha256_file(archive.path())? != artifact.archive_sha256 {
-        bail!("downloaded Biber archive failed SHA-256 verification");
-    }
+    let archive = download_verified_archive(artifact, root, backend)?;
 
-    let mut executable = tempfile::NamedTempFile::new_in(root)?;
+    let mut executable = tempfile::Builder::new()
+        .prefix("biber-")
+        .suffix(if cfg!(windows) { ".exe" } else { "" })
+        .tempfile_in(root)?;
     extract_executable(archive.path(), artifact, executable.as_file_mut())?;
     executable.flush()?;
     let executable_hash = sha256_file(executable.path())?;
@@ -302,23 +298,55 @@ fn resolve_with_backend<B: GetUrlBackend>(
             .as_file()
             .set_permissions(fs::Permissions::from_mode(0o700))?;
     }
-    let final_path = root.join(if cfg!(windows) { "biber.exe" } else { "biber" });
-    remove_if_present(&final_path)?;
-    executable.persist(&final_path)?;
+    let (_, final_path) = executable.keep()?;
     let mut marker = tempfile::NamedTempFile::new_in(root)?;
     write!(marker, "{} {}", artifact.archive_sha256, executable_hash)?;
-    let marker_path = root.join("biber.sha256");
-    remove_if_present(&marker_path)?;
+    let marker_path = root.join(format!(
+        "{}.sha256",
+        final_path.file_name().unwrap().to_string_lossy()
+    ));
     marker.persist(marker_path)?;
     Ok(final_path)
 }
 
-fn remove_if_present(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+fn download_verified_archive<B: GetUrlBackend>(
+    artifact: &Artifact<'_>,
+    root: &Path,
+    backend: &mut B,
+) -> Result<tempfile::NamedTempFile> {
+    let mut urls = vec![artifact.url.to_owned()];
+    // SourceForge moves the newest release from `current` into its numbered
+    // directory when the next version arrives. The checksum stays pinned.
+    if artifact.version == "2.22" {
+        urls.push(artifact.url.replace("/current/", "/2.22/"));
     }
+
+    let mut last_error = None;
+    for url in urls {
+        let attempt = (|| -> Result<tempfile::NamedTempFile> {
+            let mut archive = tempfile::NamedTempFile::new_in(root)?;
+            let response = backend.get_url(&url).with_context(|| {
+                format!("could not download Biber {} from {url}", artifact.version)
+            })?;
+            let bytes = std::io::copy(
+                &mut response.take(MAX_ARCHIVE_BYTES + 1),
+                archive.as_file_mut(),
+            )?;
+            if bytes > MAX_ARCHIVE_BYTES {
+                bail!("Biber archive from {url} exceeds the maximum allowed size");
+            }
+            archive.flush()?;
+            if sha256_file(archive.path())? != artifact.archive_sha256 {
+                bail!("downloaded Biber archive from {url} failed SHA-256 verification");
+            }
+            Ok(archive)
+        })();
+        match attempt {
+            Ok(archive) => return Ok(archive),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap())
 }
 
 /// Resolve an upstream Biber binary if a vetted artifact exists for this host.
@@ -407,6 +435,7 @@ mod tests {
     #[derive(Default)]
     struct FixtureBackend {
         archive: Vec<u8>,
+        archived_release: Option<Vec<u8>>,
         requests: usize,
     }
 
@@ -428,8 +457,13 @@ mod tests {
             Ok(url.to_owned())
         }
 
-        fn get_url(&mut self, _url: &str) -> Result<Self::Response> {
+        fn get_url(&mut self, url: &str) -> Result<Self::Response> {
             self.requests += 1;
+            if url.contains("/2.22/") {
+                if let Some(archive) = &self.archived_release {
+                    return Ok(Cursor::new(archive.clone()));
+                }
+            }
             Ok(Cursor::new(self.archive.clone()))
         }
 
@@ -475,11 +509,33 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut backend = FixtureBackend {
             archive,
+            archived_release: None,
             requests: 0,
         };
 
         let path = resolve_with_backend(&artifact, root.path(), false, &mut backend).unwrap();
         assert_eq!(std::fs::read(path).unwrap(), b"fixture biber");
+    }
+
+    #[test]
+    fn current_release_moves_to_numbered_directory() {
+        let archive = fixture_archive(b"fixture biber");
+        let hash = tectonic_io_base::digest::bytes_to_hex(&Sha256::digest(&archive));
+        let artifact = Artifact {
+            version: "2.22",
+            url: "https://example.invalid/current/biber.tar.gz",
+            ..fixture_artifact(&hash)
+        };
+        let root = tempfile::tempdir().unwrap();
+        let mut backend = FixtureBackend {
+            archive: fixture_archive(b"newer release"),
+            archived_release: Some(archive),
+            requests: 0,
+        };
+
+        let path = resolve_with_backend(&artifact, root.path(), false, &mut backend).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"fixture biber");
+        assert_eq!(backend.requests, 2);
     }
 
     #[test]
@@ -504,6 +560,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut backend = FixtureBackend {
             archive,
+            archived_release: None,
             requests: 0,
         };
 
@@ -516,6 +573,8 @@ mod tests {
         std::fs::write(&path, b"corrupt").unwrap();
         assert!(resolve_with_backend(&artifact, root.path(), true, &mut backend).is_err());
         let repaired = resolve_with_backend(&artifact, root.path(), false, &mut backend).unwrap();
+        assert_ne!(path, repaired);
+        assert!(path.exists());
         assert_eq!(std::fs::read(repaired).unwrap(), b"fixture biber");
         assert_eq!(backend.requests, 2);
     }
@@ -527,12 +586,13 @@ mod tests {
         let artifact = fixture_artifact(&wrong_hash);
         let mut backend = FixtureBackend {
             archive: fixture_archive(b"fixture biber"),
+            archived_release: None,
             requests: 0,
         };
         assert!(resolve_with_backend(&artifact, root.path(), true, &mut backend).is_err());
         assert_eq!(backend.requests, 0);
         assert!(resolve_with_backend(&artifact, root.path(), false, &mut backend).is_err());
         assert_eq!(backend.requests, 1);
-        assert!(!root.path().join("biber").exists());
+        assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
     }
 }

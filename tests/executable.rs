@@ -400,13 +400,13 @@ fn biber_uses_compatible_cached_executable_offline() {
     let cache = tempdir.path().join("cache");
     let biber_dir = cache.join("tools/biber/2.17/linux-x86_64-gnu");
     fs::create_dir_all(&biber_dir).unwrap();
-    let biber_path = biber_dir.join("biber");
+    let biber_path = biber_dir.join("biber-fixture");
     let script = b"#!/bin/sh\nprintf '456\\n' > biberout.qqq\n";
     fs::write(&biber_path, script).unwrap();
     fs::set_permissions(&biber_path, fs::Permissions::from_mode(0o700)).unwrap();
     let executable_hash = tectonic_io_base::digest::bytes_to_hex(&sha2::Sha256::digest(script));
     fs::write(
-        biber_dir.join("biber.sha256"),
+        biber_dir.join("biber-fixture.sha256"),
         format!(
             "129d2e0332a57e985ffa253e5e9fbd28ef99af5a068d1b141145211969aa8999 {executable_hash}"
         ),
