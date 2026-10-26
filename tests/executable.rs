@@ -419,7 +419,7 @@ fn biber_uses_compatible_cached_executable_offline() {
     let fmt_arg = get_plain_format_arg();
     let mut command = prep_tectonic(tempdir.path(), &["--only-cached", &fmt_arg, "-"]);
     command
-        .env("TECTONIC_CACHE_DIR", cache)
+        .env("TECTONIC_CACHE_DIR", "cache")
         .env_remove("TECTONIC_TEST_FAKE_BIBER")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

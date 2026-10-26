@@ -354,7 +354,13 @@ pub(crate) fn resolve(version: &str, only_cached: bool) -> Result<Option<PathBuf
     let Some(artifact) = artifact_for(version) else {
         return Ok(None);
     };
-    let root = app_dirs::get_user_cache_dir("tools")?
+    let tools_dir = app_dirs::get_user_cache_dir("tools")?;
+    let tools_dir = if tools_dir.is_absolute() {
+        tools_dir
+    } else {
+        std::env::current_dir()?.join(tools_dir)
+    };
+    let root = tools_dir
         .join("biber")
         .join(artifact.version)
         .join(artifact.platform);
